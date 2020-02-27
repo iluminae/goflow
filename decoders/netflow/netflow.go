@@ -105,15 +105,32 @@ func DecodeTemplateSet(payload *bytes.Buffer) ([]TemplateRecord, error) {
 
 		fields := make([]Field, int(templateRecord.FieldCount))
 		for i := 0; i < int(templateRecord.FieldCount); i++ {
-			field := Field{}
-			err = utils.BinaryDecoder(payload, &field)
-			fields[i] = field
+			var typeId, length uint16
+			_ = utils.BinaryDecoder(payload, &typeId, &length)
+			if typeId >= 0x8000 {
+				//has enterpise ID
+				typeId -= 0x8000
+				var enterpriseId uint32
+				_ = utils.BinaryDecoder(payload, &enterpriseId)
+			}
+			fields[i] = Field{Type: typeId, Length: length}
 		}
 		templateRecord.Fields = fields
 		records = append(records, templateRecord)
 	}
 
 	return records, nil
+}
+func GetMinTemplateSize(template []Field) int {
+	sum := 0
+	for _, templateField := range template {
+		if templateField.Length == 65535 {
+			sum++
+		} else {
+			sum += int(templateField.Length)
+		}
+	}
+	return sum
 }
 
 func GetTemplateSize(template []Field) int {
@@ -229,13 +246,33 @@ func DecodeOptionsDataSet(payload *bytes.Buffer, listFieldsScopes, listFieldsOpt
 func DecodeDataSet(payload *bytes.Buffer, listFields []Field) ([]DataRecord, error) {
 	records := make([]DataRecord, 0)
 
-	listFieldsSize := GetTemplateSize(listFields)
+	listFieldsSize := GetMinTemplateSize(listFields)
 	for payload.Len() >= listFieldsSize {
-		payloadLim := bytes.NewBuffer(payload.Next(listFieldsSize))
-		values := DecodeDataSetUsingFields(payloadLim, listFields)
+		dataFields := make([]DataField, len(listFields))
 
+		for i, templateField := range listFields {
+			length := 0
+			if templateField.Length == 65535 {
+				lengthbuf := payload.Next(1)
+				if lengthbuf[0] == byte(255) {
+					//read longer length
+					lengthbuf = payload.Next(2)
+					length = int(lengthbuf[0])*256 + int(lengthbuf[1])
+				} else {
+					length = int(lengthbuf[0])
+				}
+			} else {
+				length = int(templateField.Length)
+			}
+			value := payload.Next(length)
+			nfvalue := DataField{
+				Type:  templateField.Type,
+				Value: value,
+			}
+			dataFields[i] = nfvalue
+		}
 		record := DataRecord{
-			Values: values,
+			Values: dataFields,
 		}
 
 		records = append(records, record)
