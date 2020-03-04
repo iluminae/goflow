@@ -8,6 +8,8 @@ import (
 	"sync"
 )
 
+const IANAIPFIXBITMASK = 0x8000
+
 type FlowBaseTemplateSet map[uint16]map[uint32]map[uint16]interface{}
 
 type NetFlowTemplateSystem interface {
@@ -94,8 +96,7 @@ func DecodeTemplateSet(payload *bytes.Buffer) ([]TemplateRecord, error) {
 	var err error
 	for payload.Len() >= 4 {
 		templateRecord := TemplateRecord{}
-		err = utils.BinaryDecoder(payload, &templateRecord.TemplateId, &templateRecord.FieldCount)
-		if err != nil {
+		if err = utils.BinaryDecoder(payload, &templateRecord.TemplateId, &templateRecord.FieldCount); err != nil {
 			break
 		}
 
@@ -103,15 +104,21 @@ func DecodeTemplateSet(payload *bytes.Buffer) ([]TemplateRecord, error) {
 			return records, NewErrorDecodingNetFlow("Error decoding TemplateSet: zero count.")
 		}
 
-		fields := make([]Field, int(templateRecord.FieldCount))
+		fields := make([]interface{}, int(templateRecord.FieldCount))
 		for i := 0; i < int(templateRecord.FieldCount); i++ {
 			var typeId, length uint16
-			_ = utils.BinaryDecoder(payload, &typeId, &length)
-			if typeId >= 0x8000 {
+			if err := utils.BinaryDecoder(payload, &typeId, &length); err != nil {
+				return nil, err
+			}
+			if typeId&IANAIPFIXBITMASK != 0 { //TODO:: decide if this is IPFIX or not some other way
 				//has enterpise ID
-				typeId -= 0x8000
+				typeId = typeId &^ IANAIPFIXBITMASK
 				var enterpriseId uint32
-				_ = utils.BinaryDecoder(payload, &enterpriseId)
+				if err := utils.BinaryDecoder(payload, &enterpriseId); err != nil {
+					return nil, err
+				}
+				fields[i] = IPFIXTemplateField{Field: Field{Type: typeId, Length: length}, EnterpriseID: enterpriseId}
+				continue
 			}
 			fields[i] = Field{Type: typeId, Length: length}
 		}
@@ -121,13 +128,18 @@ func DecodeTemplateSet(payload *bytes.Buffer) ([]TemplateRecord, error) {
 
 	return records, nil
 }
-func GetMinTemplateSize(template []Field) int {
+func GetMinTemplateSize(template []interface{}) int {
 	sum := 0
-	for _, templateField := range template {
-		if templateField.Length == 65535 {
-			sum++
-		} else {
+	for _, tf := range template {
+		switch templateField := tf.(type) {
+		case Field:
 			sum += int(templateField.Length)
+		case IPFIXTemplateField:
+			if templateField.Length == 0xFFFF {
+				sum++
+			} else {
+				sum += int(templateField.Length)
+			}
 		}
 	}
 	return sum
@@ -243,33 +255,43 @@ func DecodeOptionsDataSet(payload *bytes.Buffer, listFieldsScopes, listFieldsOpt
 	return records, nil
 }
 
-func DecodeDataSet(payload *bytes.Buffer, listFields []Field) ([]DataRecord, error) {
+func DecodeDataSet(payload *bytes.Buffer, listFields []interface{}) ([]DataRecord, error) {
 	records := make([]DataRecord, 0)
 
 	listFieldsSize := GetMinTemplateSize(listFields)
 	for payload.Len() >= listFieldsSize {
 		dataFields := make([]DataField, len(listFields))
 
-		for i, templateField := range listFields {
-			length := 0
-			if templateField.Length == 65535 {
-				lengthbuf := payload.Next(1)
-				if lengthbuf[0] == byte(255) {
-					//read longer length
-					lengthbuf = payload.Next(2)
-					length = int(lengthbuf[0])*256 + int(lengthbuf[1])
-				} else {
-					length = int(lengthbuf[0])
+		for i, tf := range listFields {
+			switch templateField := tf.(type) {
+			case Field:
+				length := int(templateField.Length)
+				value := payload.Next(length)
+				nfvalue := DataField{
+					Type:  templateField.Type,
+					Value: value,
 				}
-			} else {
-				length = int(templateField.Length)
+				dataFields[i] = nfvalue
+			case IPFIXTemplateField:
+				length := templateField.Length
+				if templateField.Length == 0xFFFF {
+					lengthbuf := payload.Next(1)
+					if lengthbuf[0] == 0xFF {
+						//read longer length
+						lengthbuf = payload.Next(2)
+						length = uint16(int(lengthbuf[0])*256 + int(lengthbuf[1]))
+					} else {
+						length = uint16(lengthbuf[0])
+					}
+				}
+				value := payload.Next(int(length))
+				nfvalue := DataField{
+					Type:   templateField.Type,
+					Value:  value,
+					Length: templateField.Length,
+				}
+				dataFields[i] = nfvalue
 			}
-			value := payload.Next(length)
-			nfvalue := DataField{
-				Type:  templateField.Type,
-				Value: value,
-			}
-			dataFields[i] = nfvalue
 		}
 		record := DataRecord{
 			Values: dataFields,
